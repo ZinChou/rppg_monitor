@@ -5,7 +5,7 @@ import cv2
 import numpy as np
 from scipy.signal import butter, filtfilt, welch
 from display import ProUI
-from utils import estimate_hr_from_rppg
+from utils import estimate_hr_from_rppg, bandpass_filter, normalize_signal
 
 class Monitor:
     """
@@ -49,6 +49,10 @@ class Monitor:
 
         self.frame_times = deque(maxlen=120)
 
+        self.bpm_low = 42
+        self.bpm_high = 180
+
+
         self.last_face_box = None
         self.last_face_time = 0.0
         self.face_hold_seconds = 0.8
@@ -64,14 +68,7 @@ class Monitor:
             return 30.0
         return 1.0 / mean_diff
 
-    def normalize_signal(self, x):
-        x = np.asarray(x, dtype=np.float64)
-        std = np.std(x)
-        if std < 1e-8:
-            return x - np.mean(x)
-        return (x - np.mean(x)) / std
-
-
+    
     def detect_face(self, frame_bgr):
         gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
 
@@ -219,8 +216,8 @@ class Monitor:
 
         while len(self.timestamps) > 0 and self.timestamps[0] < min_t:
             self.timestamps.popleft()
-            if len(self.rgb_buffer) > 0:
-                self.rgb_buffer.popleft()
+            if len(self.frame_buffer) > 0:
+                self.frame_buffer.popleft()
             if len(self.rppg_buffer) > 0:
                 self.rppg_buffer.popleft()
 
@@ -236,15 +233,15 @@ class Monitor:
         sig = np.array(list(self.rppg_buffer)[-90:], dtype=np.float64)
         sig = sig - np.mean(sig)
         return float(np.std(sig))
-
+   
     def get_filtered_rppg_for_display(self):
         if len(self.rppg_buffer) < 8:
             return list(self.rppg_buffer)
 
         y = np.array(self.rppg_buffer, dtype=np.float64)
         fs = self.get_fps()
-        y = self.bandpass_filter(y, fs, self.bpm_low, self.bpm_high)
-        y = self.normalize_signal(y)
+        y = bandpass_filter(y, fs, self.bpm_low, self.bpm_high)
+        y = normalize_signal(y)
         return y.tolist()
 
     def draw_roi_overlay(self, frame, face_box, mask):
@@ -361,7 +358,7 @@ class Monitor:
                     video_clip = video_clip[None, ...]  # add batch dim
 
                     # ⭐ 调用模型
-                    rppg = self.model(video_clip)
+                    rppg = self.model.forward(video_clip)
 
                     if rppg is not None:
                         latest = float(rppg[0, -1])
@@ -370,7 +367,7 @@ class Monitor:
                     # ⭐ BPM计算
                     if now - last_bpm_update > 1.0 and len(self.rppg_buffer) > 30:
                         fs = self.get_fps()
-                        bpm = self.estimate_hr_from_rppg(
+                        bpm = estimate_hr_from_rppg(
                             list(self.rppg_buffer), fs
                         )
 

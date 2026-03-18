@@ -3,9 +3,8 @@ import time
 import numpy as np
 from collections import deque
 from scipy.signal import butter, filtfilt, welch
-import torch.nn as nn
 
-class POS(nn.Module):
+class POS():
     """
     使用摄像头实时进行 rPPG 和心率监测（POS算法）
     - 人脸检测：OpenCV Haar Cascade
@@ -34,26 +33,6 @@ class POS(nn.Module):
         self.face_hold_seconds = 0.8
 
         self.fs = 30
-
-    def bandpass_filter(self, signal, fs, low_bpm=42, high_bpm=180, order=3):
-        if len(signal) < max(15, order * 3):
-            return signal
-
-        nyq = 0.5 * fs
-        low = (low_bpm / 60.0) / nyq
-        high = (high_bpm / 60.0) / nyq
-
-        low = max(low, 1e-5)
-        high = min(high, 0.99)
-
-        if low >= high:
-            return signal
-
-        b, a = butter(order, [low, high], btype="band")
-        try:
-            return filtfilt(b, a, signal)
-        except Exception:
-            return signal
 
     def detect_face(self, frame_bgr):
         gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
