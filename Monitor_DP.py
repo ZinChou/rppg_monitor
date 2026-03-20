@@ -1,15 +1,21 @@
 import multiprocessing as mp
+import os
 import queue
 import time
 from collections import deque
 
 import cv2
 import numpy as np
-from preproc import Data_Processor
+import torch
+
 from display import ProUI
-from model.POS import POS
 from model.Physformer.Physformer import ViT_ST_ST_Compact3_TDC_gra_sharp
 from utils import estimate_hr_from_rppg, bandpass_filter, normalize_signal
+
+
+DEFAULT_MODEL_WINDOW = 160
+DEFAULT_IMAGE_SIZE = 128
+DEFAULT_INFERENCE_STRIDE = 5
 
 
 def _put_latest(mp_queue, item):
@@ -32,6 +38,122 @@ def _drain_latest(mp_queue):
         except queue.Empty:
             break
     return latest
+
+
+def _resolve_device(device):
+    if device is not None:
+        if device.startswith("cuda") and not torch.cuda.is_available():
+            return "cpu"
+        return device
+    return "cuda" if torch.cuda.is_available() else "cpu"
+
+
+def _extract_state_dict(checkpoint):
+    if isinstance(checkpoint, dict):
+        for key in ("state_dict", "model_state_dict", "model", "net"):
+            value = checkpoint.get(key)
+            if isinstance(value, dict):
+                return value
+    return checkpoint
+
+
+def _load_physformer_model(device, weights_path=None, model_window=DEFAULT_MODEL_WINDOW):
+    model = ViT_ST_ST_Compact3_TDC_gra_sharp(
+        image_size=(model_window, DEFAULT_IMAGE_SIZE, DEFAULT_IMAGE_SIZE),
+        patches=(4, 4, 4),
+        dim=96,
+        ff_dim=144,
+        num_heads=4,
+        num_layers=12,
+        dropout_rate=0.1,
+        theta=0.7,
+    ).to(device)
+    model.eval()
+
+    warning_message = None
+    if weights_path:
+        if os.path.exists(weights_path):
+            checkpoint = torch.load(weights_path, map_location=device)
+            state_dict = _extract_state_dict(checkpoint)
+            clean_state_dict = {}
+            for key, value in state_dict.items():
+                clean_key = key.replace("module.", "")
+                clean_state_dict[clean_key] = value
+            missing_keys, unexpected_keys = model.load_state_dict(clean_state_dict, strict=False)
+            if missing_keys or unexpected_keys:
+                warning_message = (
+                    "PhysFormer weights loaded with key mismatch. "
+                    f"missing={len(missing_keys)}, unexpected={len(unexpected_keys)}"
+                )
+        else:
+            warning_message = f"PhysFormer weights not found: {weights_path}"
+    else:
+        warning_message = "PhysFormer weights were not provided. Model will run with random initialization."
+
+    return model, warning_message
+
+
+def _build_face_detector():
+    cascade_path = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+    detector = cv2.CascadeClassifier(cascade_path)
+    if detector.empty():
+        raise RuntimeError("Unable to load OpenCV Haar Cascade face detector.")
+    return detector
+
+
+def _detect_face(frame, detector):
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    faces = detector.detectMultiScale(
+        gray,
+        scaleFactor=1.1,
+        minNeighbors=5,
+        minSize=(80, 80),
+    )
+    if len(faces) == 0:
+        return None
+    return max(faces, key=lambda box: box[2] * box[3])
+
+
+def _expand_face_box(frame_shape, face_box, scale=1.25):
+    if face_box is None:
+        return None
+    h, w = frame_shape[:2]
+    x, y, fw, fh = face_box
+    cx = x + fw / 2.0
+    cy = y + fh / 2.0
+    size = int(max(fw, fh) * scale)
+    x1 = max(0, int(round(cx - size / 2.0)))
+    y1 = max(0, int(round(cy - size / 2.0)))
+    x2 = min(w, x1 + size)
+    y2 = min(h, y1 + size)
+    return x1, y1, x2, y2
+
+
+def _crop_face_frame(frame, face_box, image_size, last_face_frame):
+    if face_box is not None:
+        expanded = _expand_face_box(frame.shape, face_box)
+        if expanded is not None:
+            x1, y1, x2, y2 = expanded
+            face = frame[y1:y2, x1:x2]
+            if face.size != 0:
+                face_rgb = cv2.cvtColor(face, cv2.COLOR_BGR2RGB)
+                resized = cv2.resize(face_rgb, (image_size, image_size), interpolation=cv2.INTER_LINEAR)
+                return resized, resized
+
+    if last_face_frame is not None:
+        return last_face_frame.copy(), last_face_frame
+
+    fallback = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    fallback = cv2.resize(fallback, (image_size, image_size), interpolation=cv2.INTER_LINEAR)
+    return fallback, fallback
+
+
+def _frames_to_model_input(face_frames, device):
+    clip = np.stack(face_frames, axis=0).astype(np.float32)
+    clip = (clip - 127.5) / 128.0
+    clip = np.transpose(clip, (3, 0, 1, 2))
+    tensor = torch.from_numpy(clip).unsqueeze(0).to(device)
+    return tensor
 
 
 def camera_capture_worker(camera_id, target_fps, frame_queue, processing_queue, stop_event):
@@ -95,28 +217,37 @@ def rppg_worker(
     result_queue,
     stop_event,
     buffer_seconds,
-    pos_window_seconds,
     target_fps,
     bpm_low,
     bpm_high,
+    model_weights,
+    model_device,
+    model_window,
+    inference_stride,
 ):
-    model = ViT_ST_ST_Compact3_TDC_gra_sharp(
-        image_size=(160,128,128),
-        patches=(4,4,4), 
-        dim=96,
-        ff_dim=144, 
-        num_heads=4, 
-        num_layers=12, 
-        dropout_rate=0.1, 
-        theta=0.7).cuda()
-    
-    preprocessor = Data_Processor(image_size=128, device='cuda')
-     
-    
-    fs = target_fps
+    device = _resolve_device(model_device)
 
-    timestamps = deque()
-    rgb_buffer = deque()
+    try:
+        model, model_warning = _load_physformer_model(
+            device=device,
+            weights_path=model_weights,
+            model_window=model_window,
+        )
+        face_detector = _build_face_detector()
+    except Exception as exc:
+        _put_latest(
+            result_queue,
+            {
+                "type": "error",
+                "message": f"Failed to initialize deep rPPG worker: {exc}",
+                "timestamp": time.time(),
+            },
+        )
+        return
+
+    face_frames = deque(maxlen=model_window)
+    clip_timestamps = deque(maxlen=model_window)
+    signal_timestamps = deque()
     rppg_buffer = deque()
     bpm_buffer = deque()
     bpm_timestamps = deque()
@@ -124,13 +255,16 @@ def rppg_worker(
 
     current_bpm = None
     last_bpm_update = 0.0
+    latest_face_box = None
+    last_face_frame = None
+    total_frames_seen = 0
+    infer_count = 0
+    last_inference_at = 0.0
 
     def trim_buffers(current_t):
         min_t = current_t - buffer_seconds
-        while timestamps and timestamps[0] < min_t:
-            timestamps.popleft()
-            if rgb_buffer:
-                rgb_buffer.popleft()
+        while signal_timestamps and signal_timestamps[0] < min_t:
+            signal_timestamps.popleft()
             if rppg_buffer:
                 rppg_buffer.popleft()
 
@@ -167,34 +301,56 @@ def rppg_worker(
         frame = packet["frame"]
         timestamp = packet["timestamp"]
         frame_times.append(timestamp)
+        total_frames_seen += 1
 
-        face_box = model.detect_face(frame)
-        latest_rppg = None
+        latest_face_box = _detect_face(frame, face_detector)
+        face_frame, last_face_frame = _crop_face_frame(
+            frame,
+            latest_face_box,
+            DEFAULT_IMAGE_SIZE,
+            last_face_frame,
+        )
+        face_frames.append(face_frame)
+        clip_timestamps.append(timestamp)
 
-        if face_box is not None:
-            mask = model.build_roi_mask_from_face_box(frame.shape, face_box)
-            mean_rgb = model.extract_mean_rgb(frame, mask)
-            if mean_rgb is not None:
-                timestamps.append(timestamp)
-                rgb_buffer.append(mean_rgb)
+        should_infer = (
+            len(face_frames) == model_window
+            and (infer_count == 0 or total_frames_seen % max(1, inference_stride) == 0)
+        )
 
-                win_size = max(10, int(pos_window_seconds * compute_fps()))
-                if len(rgb_buffer) >= win_size:
-                    rgb_window = np.array(list(rgb_buffer)[-win_size:], dtype=np.float64)
-                    h = model.compute_pos_signal(rgb_window)
-                    if h is not None and len(h) > 0:
-                        latest_rppg = float(h[-1])
-                        rppg_buffer.append(latest_rppg)
-                    else:
-                        rppg_buffer.append(0.0)
+        if should_infer:
+            try:
+                inputs = _frames_to_model_input(list(face_frames), device)
+                with torch.no_grad():
+                    rppg_pred, _, _, _ = model(inputs, gra_sharp=2.0)
+                pred = rppg_pred.detach().float().cpu().numpy().reshape(-1)
+                pred = normalize_signal(pred)
+
+                if infer_count == 0:
+                    new_count = len(pred)
+                    new_values = pred
+                    new_timestamps = list(clip_timestamps)
                 else:
-                    rppg_buffer.append(0.0)
-            else:
-                timestamps.append(timestamp)
-                rppg_buffer.append(0.0)
-        else:
-            timestamps.append(timestamp)
-            rppg_buffer.append(0.0)
+                    new_count = min(max(1, inference_stride), len(pred), len(clip_timestamps))
+                    new_values = pred[-new_count:]
+                    new_timestamps = list(clip_timestamps)[-new_count:]
+
+                for sample_t, sample_v in zip(new_timestamps, new_values):
+                    signal_timestamps.append(sample_t)
+                    rppg_buffer.append(float(sample_v))
+
+                infer_count += 1
+                last_inference_at = timestamp
+            except Exception as exc:
+                _put_latest(
+                    result_queue,
+                    {
+                        "type": "error",
+                        "message": f"Deep rPPG inference failed: {exc}",
+                        "timestamp": timestamp,
+                    },
+                )
+                return
 
         trim_buffers(timestamp)
 
@@ -213,13 +369,20 @@ def rppg_worker(
         _put_latest(
             result_queue,
             {
+                "type": "result",
                 "timestamp": timestamp,
-                "face_box": face_box,
+                "face_box": latest_face_box,
                 "rppg_values": list(rppg_buffer),
                 "bpm_values": list(bpm_buffer),
                 "current_bpm": current_bpm,
                 "quality": compute_quality(),
                 "fps": fs,
+                "device": device,
+                "model_window": model_window,
+                "inference_stride": inference_stride,
+                "model_warning": model_warning,
+                "warmup_progress": min(1.0, len(face_frames) / float(model_window)),
+                "last_inference_at": last_inference_at,
             },
         )
 
@@ -233,6 +396,10 @@ class Monitor:
         pos_window_seconds=1.6,
         display_scale=1.0,
         target_fps=30.0,
+        model_weights=None,
+        model_device=None,
+        model_window=DEFAULT_MODEL_WINDOW,
+        inference_stride=DEFAULT_INFERENCE_STRIDE,
     ):
         self.model = model
         self.camera_id = camera_id
@@ -240,6 +407,10 @@ class Monitor:
         self.pos_window_seconds = pos_window_seconds
         self.display_scale = display_scale
         self.target_fps = float(target_fps)
+        self.model_weights = model_weights
+        self.model_device = model_device
+        self.model_window = int(model_window)
+        self.inference_stride = int(inference_stride)
 
         self.bpm_low = 42
         self.bpm_high = 180
@@ -368,7 +539,15 @@ class Monitor:
             dashboard, margin, top_y, card_w, card_h, "Heart Rate", bpm_text, "bpm", accent=(0, 210, 255)
         )
         dashboard = self.ui.draw_metric_card(
-            dashboard, margin, top_y + card_h + card_gap, card_w, card_h, "Frame Rate", f"{fps:.1f}", "fps", accent=(255, 190, 0)
+            dashboard,
+            margin,
+            top_y + card_h + card_gap,
+            card_w,
+            card_h,
+            "Frame Rate",
+            f"{fps:.1f}",
+            "fps",
+            accent=(255, 190, 0),
         )
         dashboard = self.ui.draw_quality_card(
             dashboard, margin, top_y + (card_h + card_gap) * 2, card_w, card_h + 12, quality
@@ -427,10 +606,13 @@ class Monitor:
                 result_queue,
                 stop_event,
                 self.buffer_seconds,
-                self.pos_window_seconds,
                 self.target_fps,
                 self.bpm_low,
                 self.bpm_high,
+                self.model_weights,
+                self.model_device,
+                self.model_window,
+                self.inference_stride,
             ),
             daemon=True,
         )
@@ -445,6 +627,7 @@ class Monitor:
             "current_bpm": None,
             "quality": 0.0,
             "fps": self.target_fps,
+            "model_warning": None,
         }
 
         try:
@@ -457,6 +640,8 @@ class Monitor:
 
                 result_packet = _drain_latest(result_queue)
                 if result_packet is not None:
+                    if result_packet.get("type") == "error":
+                        raise RuntimeError(result_packet.get("message", "rPPG worker failed."))
                     latest_result = result_packet
 
                 if latest_frame is None:
@@ -477,7 +662,7 @@ class Monitor:
                     latest_result.get("fps", self.target_fps),
                     latest_result.get("quality", 0.0),
                 )
-                cv2.imshow("rPPG Monitor", display)
+                cv2.imshow("rPPG Monitor (Deep)", display)
 
                 if cv2.waitKey(1) & 0xFF == ord("q"):
                     break
