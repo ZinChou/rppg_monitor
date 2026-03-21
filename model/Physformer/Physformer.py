@@ -189,7 +189,7 @@ class ViT_ST_ST_Compact3_TDC_gra_sharp(nn.Module):
         #pdb.set_trace()
         
         rPPG = rPPG.squeeze(1)
-        
+
         return rPPG, Score1, Score2, Score3
 
 

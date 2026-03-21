@@ -282,12 +282,66 @@ def rppg_worker(
             return float(target_fps)
         return float(1.0 / mean_diff)
 
-    def compute_quality():
-        if len(rppg_buffer) < 30:
+    def compute_quality(fps=30.0):
+        """
+        基于周期性评定 rPPG 信号质量
+        返回值: 0.0 ~ 1.0，越大表示周期性越强、质量越好
+        """
+        min_len = int(fps * 3)   # 至少3秒
+        if len(rppg_buffer) < min_len:
             return 0.0
-        sig = np.array(list(rppg_buffer)[-90:], dtype=np.float64)
+
+        # 取最近 8 秒，过短不稳定，过长对实时性不好
+        win_len = min(len(rppg_buffer), int(fps * 8))
+        sig = np.array(list(rppg_buffer)[-win_len:], dtype=np.float64)
+
+        # 去均值
         sig = sig - np.mean(sig)
-        return float(np.std(sig))
+
+        # 振幅太小，直接认为质量差
+        sig_std = np.std(sig)
+        if sig_std < 1e-6:
+            return 0.0
+
+        # 归一化
+        sig = sig / sig_std
+
+        # 自相关
+        acf = np.correlate(sig, sig, mode='full')
+        acf = acf[len(acf)//2:]
+        acf = acf / (acf[0] + 1e-8)
+
+        # 心率范围: 40~180 BPM
+        # 对应周期范围
+        min_bpm = 40
+        max_bpm = 180
+        min_lag = int(fps * 60 / max_bpm)  # 最短周期
+        max_lag = int(fps * 60 / min_bpm)  # 最长周期
+
+        if max_lag >= len(acf):
+            max_lag = len(acf) - 1
+        if min_lag >= max_lag:
+            return 0.0
+
+        search_region = acf[min_lag:max_lag + 1]
+        peak = np.max(search_region)
+
+        # 峰值位置对应主周期
+        peak_idx = np.argmax(search_region) + min_lag
+
+        # 再检查该周期的倍周期是否也有一定一致性
+        harmonic_score = 0.0
+        if 2 * peak_idx < len(acf):
+            harmonic_score = max(0.0, acf[2 * peak_idx])
+
+        # 组合评分
+        # peak 越高说明周期性越明显
+        # harmonic_score 越高说明重复节律更稳定
+        quality = 0.7 * peak + 0.3 * harmonic_score
+
+        # 限制到 0~1
+        quality = float(np.clip(quality, 0.0, 1.0))
+        return quality
 
     while not stop_event.is_set():
         try:
@@ -304,12 +358,14 @@ def rppg_worker(
         total_frames_seen += 1
 
         latest_face_box = _detect_face(frame, face_detector)
+        start = time.time()
         face_frame, last_face_frame = _crop_face_frame(
             frame,
             latest_face_box,
             DEFAULT_IMAGE_SIZE,
             last_face_frame,
         )
+        print(time.time() - start)
         face_frames.append(face_frame)
         clip_timestamps.append(timestamp)
 
