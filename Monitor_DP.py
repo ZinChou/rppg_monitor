@@ -250,9 +250,11 @@ def rppg_worker(
     signal_timestamps = deque()
     rppg_buffer = deque()
     bpm_buffer = deque()
+    pending_rppg_points = deque()   # [(sample_t, sample_v), ...]
     bpm_timestamps = deque()
     frame_times = deque(maxlen=120)
 
+    next_rppg_emit_time = None
     current_bpm = None
     last_bpm_update = 0.0
     latest_face_box = None
@@ -391,9 +393,12 @@ def rppg_worker(
                     new_values = pred[-new_count:]
                     new_timestamps = list(clip_timestamps)[-new_count:]
 
+                # 不直接写入 rppg_buffer，先缓存
                 for sample_t, sample_v in zip(new_timestamps, new_values):
-                    signal_timestamps.append(sample_t)
-                    rppg_buffer.append(float(sample_v))
+                    pending_rppg_points.append((sample_t, float(sample_v)))
+
+                if next_rppg_emit_time is None and pending_rppg_points:
+                    next_rppg_emit_time = timestamp
 
                 infer_count += 1
                 last_inference_at = timestamp
@@ -408,9 +413,22 @@ def rppg_worker(
                 )
                 return
 
+        fs = compute_fps()
+        emit_interval = 1.0 / max(fs, 1e-6)
+
+        point_emitted = False
+        if pending_rppg_points and next_rppg_emit_time is not None and timestamp >= next_rppg_emit_time:
+            sample_t, sample_v = pending_rppg_points.popleft()
+            signal_timestamps.append(sample_t)
+            rppg_buffer.append(sample_v)
+            point_emitted = True
+            next_rppg_emit_time += emit_interval
+
+            if not pending_rppg_points:
+                next_rppg_emit_time = None
+
         trim_buffers(timestamp)
 
-        fs = compute_fps()
         if timestamp - last_bpm_update > 1.0 and len(rppg_buffer) > max(30, int(fs * 4)):
             bpm = estimate_hr_from_rppg(list(rppg_buffer), fs, bpm_low=bpm_low, bpm_high=bpm_high)
             if bpm is not None:
@@ -422,25 +440,27 @@ def rppg_worker(
                 bpm_buffer.append(current_bpm)
             last_bpm_update = timestamp
 
-        _put_latest(
-            result_queue,
-            {
-                "type": "result",
-                "timestamp": timestamp,
-                "face_box": latest_face_box,
-                "rppg_values": list(rppg_buffer),
-                "bpm_values": list(bpm_buffer),
-                "current_bpm": current_bpm,
-                "quality": compute_quality(),
-                "fps": fs,
-                "device": device,
-                "model_window": model_window,
-                "inference_stride": inference_stride,
-                "model_warning": model_warning,
-                "warmup_progress": min(1.0, len(face_frames) / float(model_window)),
-                "last_inference_at": last_inference_at,
-            },
-        )
+        # 只有在新增了一个 rPPG 点时，再更新 result_packet
+        if point_emitted:
+            _put_latest(
+                result_queue,
+                {
+                    "type": "result",
+                    "timestamp": timestamp,
+                    "face_box": latest_face_box,
+                    "rppg_values": list(rppg_buffer),
+                    "bpm_values": list(bpm_buffer),
+                    "current_bpm": current_bpm,
+                    "quality": compute_quality(fs),
+                    "fps": fs,
+                    "device": device,
+                    "model_window": model_window,
+                    "inference_stride": inference_stride,
+                    "model_warning": model_warning,
+                    "warmup_progress": min(1.0, len(face_frames) / float(model_window)),
+                    "last_inference_at": last_inference_at,
+                },
+            )
 
 
 class Monitor:
