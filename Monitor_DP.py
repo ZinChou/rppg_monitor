@@ -250,9 +250,11 @@ def rppg_worker(
     signal_timestamps = deque()
     rppg_buffer = deque()
     bpm_buffer = deque()
+    pending_rppg_points = deque()   # [(sample_t, sample_v), ...]
     bpm_timestamps = deque()
     frame_times = deque(maxlen=120)
 
+    next_rppg_emit_time = None
     current_bpm = None
     last_bpm_update = 0.0
     latest_face_box = None
@@ -282,12 +284,66 @@ def rppg_worker(
             return float(target_fps)
         return float(1.0 / mean_diff)
 
-    def compute_quality():
-        if len(rppg_buffer) < 30:
+    def compute_quality(fps=30.0):
+        """
+        基于周期性评定 rPPG 信号质量
+        返回值: 0.0 ~ 1.0，越大表示周期性越强、质量越好
+        """
+        min_len = int(fps * 3)   # 至少3秒
+        if len(rppg_buffer) < min_len:
             return 0.0
-        sig = np.array(list(rppg_buffer)[-90:], dtype=np.float64)
+
+        # 取最近 8 秒，过短不稳定，过长对实时性不好
+        win_len = min(len(rppg_buffer), int(fps * 8))
+        sig = np.array(list(rppg_buffer)[-win_len:], dtype=np.float64)
+
+        # 去均值
         sig = sig - np.mean(sig)
-        return float(np.std(sig))
+
+        # 振幅太小，直接认为质量差
+        sig_std = np.std(sig)
+        if sig_std < 1e-6:
+            return 0.0
+
+        # 归一化
+        sig = sig / sig_std
+
+        # 自相关
+        acf = np.correlate(sig, sig, mode='full')
+        acf = acf[len(acf)//2:]
+        acf = acf / (acf[0] + 1e-8)
+
+        # 心率范围: 40~180 BPM
+        # 对应周期范围
+        min_bpm = 40
+        max_bpm = 180
+        min_lag = int(fps * 60 / max_bpm)  # 最短周期
+        max_lag = int(fps * 60 / min_bpm)  # 最长周期
+
+        if max_lag >= len(acf):
+            max_lag = len(acf) - 1
+        if min_lag >= max_lag:
+            return 0.0
+
+        search_region = acf[min_lag:max_lag + 1]
+        peak = np.max(search_region)
+
+        # 峰值位置对应主周期
+        peak_idx = np.argmax(search_region) + min_lag
+
+        # 再检查该周期的倍周期是否也有一定一致性
+        harmonic_score = 0.0
+        if 2 * peak_idx < len(acf):
+            harmonic_score = max(0.0, acf[2 * peak_idx])
+
+        # 组合评分
+        # peak 越高说明周期性越明显
+        # harmonic_score 越高说明重复节律更稳定
+        quality = 0.7 * peak + 0.3 * harmonic_score
+
+        # 限制到 0~1
+        quality = float(np.clip(quality, 0.0, 1.0))
+        return quality
 
     while not stop_event.is_set():
         try:
@@ -304,12 +360,14 @@ def rppg_worker(
         total_frames_seen += 1
 
         latest_face_box = _detect_face(frame, face_detector)
+        start = time.time()
         face_frame, last_face_frame = _crop_face_frame(
             frame,
             latest_face_box,
             DEFAULT_IMAGE_SIZE,
             last_face_frame,
         )
+        print(time.time() - start)
         face_frames.append(face_frame)
         clip_timestamps.append(timestamp)
 
@@ -335,9 +393,12 @@ def rppg_worker(
                     new_values = pred[-new_count:]
                     new_timestamps = list(clip_timestamps)[-new_count:]
 
+                # 不直接写入 rppg_buffer，先缓存
                 for sample_t, sample_v in zip(new_timestamps, new_values):
-                    signal_timestamps.append(sample_t)
-                    rppg_buffer.append(float(sample_v))
+                    pending_rppg_points.append((sample_t, float(sample_v)))
+
+                if next_rppg_emit_time is None and pending_rppg_points:
+                    next_rppg_emit_time = timestamp
 
                 infer_count += 1
                 last_inference_at = timestamp
@@ -352,9 +413,22 @@ def rppg_worker(
                 )
                 return
 
+        fs = compute_fps()
+        emit_interval = 1.0 / max(fs, 1e-6)
+
+        point_emitted = False
+        if pending_rppg_points and next_rppg_emit_time is not None and timestamp >= next_rppg_emit_time:
+            sample_t, sample_v = pending_rppg_points.popleft()
+            signal_timestamps.append(sample_t)
+            rppg_buffer.append(sample_v)
+            point_emitted = True
+            next_rppg_emit_time += emit_interval
+
+            if not pending_rppg_points:
+                next_rppg_emit_time = None
+
         trim_buffers(timestamp)
 
-        fs = compute_fps()
         if timestamp - last_bpm_update > 1.0 and len(rppg_buffer) > max(30, int(fs * 4)):
             bpm = estimate_hr_from_rppg(list(rppg_buffer), fs, bpm_low=bpm_low, bpm_high=bpm_high)
             if bpm is not None:
@@ -366,25 +440,27 @@ def rppg_worker(
                 bpm_buffer.append(current_bpm)
             last_bpm_update = timestamp
 
-        _put_latest(
-            result_queue,
-            {
-                "type": "result",
-                "timestamp": timestamp,
-                "face_box": latest_face_box,
-                "rppg_values": list(rppg_buffer),
-                "bpm_values": list(bpm_buffer),
-                "current_bpm": current_bpm,
-                "quality": compute_quality(),
-                "fps": fs,
-                "device": device,
-                "model_window": model_window,
-                "inference_stride": inference_stride,
-                "model_warning": model_warning,
-                "warmup_progress": min(1.0, len(face_frames) / float(model_window)),
-                "last_inference_at": last_inference_at,
-            },
-        )
+        # 只有在新增了一个 rPPG 点时，再更新 result_packet
+        if point_emitted:
+            _put_latest(
+                result_queue,
+                {
+                    "type": "result",
+                    "timestamp": timestamp,
+                    "face_box": latest_face_box,
+                    "rppg_values": list(rppg_buffer),
+                    "bpm_values": list(bpm_buffer),
+                    "current_bpm": current_bpm,
+                    "quality": compute_quality(fs),
+                    "fps": fs,
+                    "device": device,
+                    "model_window": model_window,
+                    "inference_stride": inference_stride,
+                    "model_warning": model_warning,
+                    "warmup_progress": min(1.0, len(face_frames) / float(model_window)),
+                    "last_inference_at": last_inference_at,
+                },
+            )
 
 
 class Monitor:
