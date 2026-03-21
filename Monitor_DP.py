@@ -15,7 +15,7 @@ from utils import estimate_hr_from_rppg, bandpass_filter, normalize_signal
 
 DEFAULT_MODEL_WINDOW = 160
 DEFAULT_IMAGE_SIZE = 128
-DEFAULT_INFERENCE_STRIDE = 5
+DEFAULT_INFERENCE_STRIDE = 80
 
 
 def _put_latest(mp_queue, item):
@@ -181,7 +181,9 @@ def camera_capture_worker(camera_id, target_fps, frame_queue, processing_queue, 
                 time.sleep(min(frame_interval / 2.0, next_frame_time - now))
                 continue
 
-            ret, frame = cap.read()
+            # ret, frame = cap.read()
+            ret = True
+            frame = np.zeros((480, 640, 3), dtype=np.uint8)  # 黑色图像（480x640）
             timestamp = time.time()
             if not ret:
                 _put_latest(
@@ -225,6 +227,15 @@ def rppg_worker(
     model_window,
     inference_stride,
 ):
+    import time
+    import threading
+    import queue as std_queue
+    from queue import Queue
+    from collections import deque
+
+    import numpy as np
+    import torch
+
     device = _resolve_device(model_device)
 
     try:
@@ -245,37 +256,62 @@ def rppg_worker(
         )
         return
 
+    # -----------------------------
+    # 共享状态
+    # -----------------------------
+    state_lock = threading.Lock()
+
     face_frames = deque(maxlen=model_window)
     clip_timestamps = deque(maxlen=model_window)
+
     signal_timestamps = deque()
     rppg_buffer = deque()
-    bpm_buffer = deque()
-    pending_rppg_points = deque()   # [(sample_t, sample_v), ...]
+
     bpm_timestamps = deque()
+    bpm_buffer = deque()
+
+    pending_rppg_points = deque()   # [(sample_t, sample_v), ...]
     frame_times = deque(maxlen=120)
+
+    latest_face_box = None
+    last_face_frame = None
 
     next_rppg_emit_time = None
     current_bpm = None
+    latest_quality = 0.0
     last_bpm_update = 0.0
-    latest_face_box = None
-    last_face_frame = None
-    total_frames_seen = 0
-    infer_count = 0
     last_inference_at = 0.0
 
-    def trim_buffers(current_t):
+    total_frames_seen = 0
+    infer_count = 0
+
+    # -----------------------------
+    # 线程内队列
+    # -----------------------------
+    infer_queue = Queue(maxsize=2)   # 主线程 -> 推理线程
+    stats_queue = Queue(maxsize=4)   # 信号线程 -> 统计线程
+
+    # -----------------------------
+    # 工具函数
+    # -----------------------------
+    def trim_buffers_locked(current_t):
         min_t = current_t - buffer_seconds
+
         while signal_timestamps and signal_timestamps[0] < min_t:
             signal_timestamps.popleft()
             if rppg_buffer:
                 rppg_buffer.popleft()
 
+        while pending_rppg_points and pending_rppg_points[0][0] < min_t:
+            pending_rppg_points.popleft()
+
         bpm_min_t = current_t - max(30, buffer_seconds * 3)
         while bpm_timestamps and bpm_timestamps[0] < bpm_min_t:
             bpm_timestamps.popleft()
-            bpm_buffer.popleft()
+            if bpm_buffer:
+                bpm_buffer.popleft()
 
-    def compute_fps():
+    def compute_fps_locked():
         if len(frame_times) < 2:
             return float(target_fps)
         diffs = np.diff(np.array(frame_times, dtype=np.float64))
@@ -284,174 +320,273 @@ def rppg_worker(
             return float(target_fps)
         return float(1.0 / mean_diff)
 
-    def compute_quality(fps=30.0):
+    def compute_quality_from_signal(sig_values, fps=30.0):
         """
         基于周期性评定 rPPG 信号质量
         返回值: 0.0 ~ 1.0，越大表示周期性越强、质量越好
         """
-        min_len = int(fps * 3)   # 至少3秒
-        if len(rppg_buffer) < min_len:
+        min_len = int(fps * 3)
+        if len(sig_values) < min_len:
             return 0.0
 
-        # 取最近 8 秒，过短不稳定，过长对实时性不好
-        win_len = min(len(rppg_buffer), int(fps * 8))
-        sig = np.array(list(rppg_buffer)[-win_len:], dtype=np.float64)
+        win_len = min(len(sig_values), int(fps * 8))
+        sig = np.array(sig_values[-win_len:], dtype=np.float64)
 
-        # 去均值
         sig = sig - np.mean(sig)
-
-        # 振幅太小，直接认为质量差
         sig_std = np.std(sig)
         if sig_std < 1e-6:
             return 0.0
 
-        # 归一化
         sig = sig / sig_std
 
-        # 自相关
-        acf = np.correlate(sig, sig, mode='full')
-        acf = acf[len(acf)//2:]
+        acf = np.correlate(sig, sig, mode="full")
+        acf = acf[len(acf) // 2 :]
         acf = acf / (acf[0] + 1e-8)
 
-        # 心率范围: 40~180 BPM
-        # 对应周期范围
-        min_bpm = 40
-        max_bpm = 180
-        min_lag = int(fps * 60 / max_bpm)  # 最短周期
-        max_lag = int(fps * 60 / min_bpm)  # 最长周期
+        min_bpm_local = 40
+        max_bpm_local = 180
+        min_lag = int(fps * 60 / max_bpm_local)
+        max_lag = int(fps * 60 / min_bpm_local)
 
         if max_lag >= len(acf):
             max_lag = len(acf) - 1
         if min_lag >= max_lag:
             return 0.0
 
-        search_region = acf[min_lag:max_lag + 1]
+        search_region = acf[min_lag : max_lag + 1]
         peak = np.max(search_region)
-
-        # 峰值位置对应主周期
         peak_idx = np.argmax(search_region) + min_lag
 
-        # 再检查该周期的倍周期是否也有一定一致性
         harmonic_score = 0.0
         if 2 * peak_idx < len(acf):
             harmonic_score = max(0.0, acf[2 * peak_idx])
 
-        # 组合评分
-        # peak 越高说明周期性越明显
-        # harmonic_score 越高说明重复节律更稳定
         quality = 0.7 * peak + 0.3 * harmonic_score
+        return float(np.clip(quality, 0.0, 1.0))
 
-        # 限制到 0~1
-        quality = float(np.clip(quality, 0.0, 1.0))
-        return quality
+    # -----------------------------
+    # 推理线程
+    # -----------------------------
+    def inference_loop():
+        nonlocal infer_count, last_inference_at, next_rppg_emit_time
 
-    while not stop_event.is_set():
-        try:
-            packet = processing_queue.get(timeout=0.1)
-        except queue.Empty:
-            continue
-
-        if packet.get("type") != "frame":
-            continue
-
-        frame = packet["frame"]
-        timestamp = packet["timestamp"]
-        frame_times.append(timestamp)
-        total_frames_seen += 1
-
-        latest_face_box = _detect_face(frame, face_detector)
-        start = time.time()
-        face_frame, last_face_frame = _crop_face_frame(
-            frame,
-            latest_face_box,
-            DEFAULT_IMAGE_SIZE,
-            last_face_frame,
-        )
-        print(time.time() - start)
-        face_frames.append(face_frame)
-        clip_timestamps.append(timestamp)
-
-        should_infer = (
-            len(face_frames) == model_window
-            and (infer_count == 0 or total_frames_seen % max(1, inference_stride) == 0)
-        )
-
-        if should_infer:
+        while not stop_event.is_set():
             try:
-                inputs = _frames_to_model_input(list(face_frames), device)
+                item = infer_queue.get(timeout=0.1)
+            except std_queue.Empty:
+                continue
+
+            if item is None:
+                break
+
+            frames_list, timestamps_list, packet_ts = item
+
+            try:
+                inputs = _frames_to_model_input(frames_list, device)
+
                 with torch.no_grad():
                     rppg_pred, _, _, _ = model(inputs, gra_sharp=2.0)
+
                 pred = rppg_pred.detach().float().cpu().numpy().reshape(-1)
                 pred = normalize_signal(pred)
 
-                if infer_count == 0:
+                with state_lock:
+                    local_infer_count = infer_count
+
+                if local_infer_count == 0:
                     new_count = len(pred)
                     new_values = pred
-                    new_timestamps = list(clip_timestamps)
+                    new_timestamps = timestamps_list
                 else:
-                    new_count = min(max(1, inference_stride), len(pred), len(clip_timestamps))
+                    new_count = min(
+                        max(1, inference_stride),
+                        len(pred),
+                        len(timestamps_list),
+                    )
                     new_values = pred[-new_count:]
-                    new_timestamps = list(clip_timestamps)[-new_count:]
+                    new_timestamps = timestamps_list[-new_count:]
 
-                # 不直接写入 rppg_buffer，先缓存
-                for sample_t, sample_v in zip(new_timestamps, new_values):
-                    pending_rppg_points.append((sample_t, float(sample_v)))
+                with state_lock:
+                    for sample_t, sample_v in zip(new_timestamps, new_values):
+                        pending_rppg_points.append((sample_t, float(sample_v)))
 
-                if next_rppg_emit_time is None and pending_rppg_points:
-                    next_rppg_emit_time = timestamp
+                    if next_rppg_emit_time is None and pending_rppg_points:
+                        # 第一次开始释放时，用当前真实时间作为节拍基准
+                        next_rppg_emit_time = time.time()
 
-                infer_count += 1
-                last_inference_at = timestamp
+                    infer_count += 1
+                    last_inference_at = packet_ts
+
             except Exception as exc:
                 _put_latest(
                     result_queue,
                     {
                         "type": "error",
                         "message": f"Deep rPPG inference failed: {exc}",
-                        "timestamp": timestamp,
+                        "timestamp": packet_ts,
                     },
                 )
+                stop_event.set()
                 return
 
-        fs = compute_fps()
-        emit_interval = 1.0 / max(fs, 1e-6)
+    # -----------------------------
+    # 信号释放线程
+    # pending_rppg_points -> rppg_buffer
+    # -----------------------------
+    def signal_emit_loop():
+        nonlocal next_rppg_emit_time
 
-        point_emitted = False
-        if pending_rppg_points and next_rppg_emit_time is not None and timestamp >= next_rppg_emit_time:
-            sample_t, sample_v = pending_rppg_points.popleft()
-            signal_timestamps.append(sample_t)
-            rppg_buffer.append(sample_v)
-            point_emitted = True
-            next_rppg_emit_time += emit_interval
+        while not stop_event.is_set():
+            packet_for_stats = None
 
-            if not pending_rppg_points:
-                next_rppg_emit_time = None
+            with state_lock:
+                fs = compute_fps_locked()
+                emit_interval = 1.0 / max(fs, 1e-6)
+                now_ts = time.time()
 
-        trim_buffers(timestamp)
+                if (
+                    pending_rppg_points
+                    and next_rppg_emit_time is not None
+                    and now_ts >= next_rppg_emit_time
+                ):
+                    sample_t, sample_v = pending_rppg_points.popleft()
+                    signal_timestamps.append(sample_t)
+                    rppg_buffer.append(sample_v)
 
-        if timestamp - last_bpm_update > 1.0 and len(rppg_buffer) > max(30, int(fs * 4)):
-            bpm = estimate_hr_from_rppg(list(rppg_buffer), fs, bpm_low=bpm_low, bpm_high=bpm_high)
-            if bpm is not None:
-                if current_bpm is None:
-                    current_bpm = bpm
-                else:
-                    current_bpm = 0.85 * current_bpm + 0.15 * bpm
-                bpm_timestamps.append(timestamp)
-                bpm_buffer.append(current_bpm)
-            last_bpm_update = timestamp
+                    trim_buffers_locked(sample_t)
 
-        # 只有在新增了一个 rPPG 点时，再更新 result_packet
-        if point_emitted:
-            _put_latest(
-                result_queue,
-                {
+                    packet_for_stats = {
+                        "timestamp": sample_t,
+                        "rppg_values": list(rppg_buffer),
+                        "fs": fs,
+                    }
+
+                    next_rppg_emit_time += emit_interval
+
+                    if not pending_rppg_points:
+                        next_rppg_emit_time = None
+
+            if packet_for_stats is not None:
+                try:
+                    stats_queue.put_nowait(packet_for_stats)
+                except std_queue.Full:
+                    pass
+
+            time.sleep(0.005)
+
+    # -----------------------------
+    # 统计线程
+    # -----------------------------
+    def stats_loop():
+        nonlocal current_bpm, latest_quality, last_bpm_update
+
+        while not stop_event.is_set():
+            try:
+                item = stats_queue.get(timeout=0.1)
+            except std_queue.Empty:
+                continue
+
+            ts = item["timestamp"]
+            fs = item["fs"]
+            rppg_values = item["rppg_values"]
+
+            quality = compute_quality_from_signal(rppg_values, fs)
+
+            bpm = None
+            if len(rppg_values) > max(30, int(fs * 4)) and (ts - last_bpm_update > 1.0):
+                bpm = estimate_hr_from_rppg(
+                    rppg_values,
+                    fs,
+                    bpm_low=bpm_low,
+                    bpm_high=bpm_high,
+                )
+
+            with state_lock:
+                latest_quality = quality
+
+                if bpm is not None:
+                    if current_bpm is None:
+                        current_bpm = bpm
+                    else:
+                        current_bpm = 0.85 * current_bpm + 0.15 * bpm
+
+                    bpm_timestamps.append(ts)
+                    bpm_buffer.append(current_bpm)
+                    last_bpm_update = ts
+
+    # -----------------------------
+    # 启动线程
+    # -----------------------------
+    infer_thread = threading.Thread(target=inference_loop, daemon=True)
+    emit_thread = threading.Thread(target=signal_emit_loop, daemon=True)
+    stats_thread = threading.Thread(target=stats_loop, daemon=True)
+
+    infer_thread.start()
+    emit_thread.start()
+    stats_thread.start()
+
+    # -----------------------------
+    # 主循环：收帧 / 检脸 / 裁脸 / 投递推理任务 / 回传结果
+    # -----------------------------
+    try:
+        while not stop_event.is_set():
+            try:
+                packet = processing_queue.get(timeout=0.1)
+            except std_queue.Empty:
+                continue
+
+            if packet.get("type") != "frame":
+                continue
+
+            frame = packet["frame"]
+            timestamp = packet["timestamp"]
+
+            local_face_box = _detect_face(frame, face_detector)
+
+            with state_lock:
+                frame_times.append(timestamp)
+                total_frames_seen += 1
+
+            face_frame, cropped_last_face_frame = _crop_face_frame(
+                frame,
+                local_face_box,
+                DEFAULT_IMAGE_SIZE,
+                last_face_frame,
+            )
+
+            should_infer = False
+            frames_list = None
+            timestamps_list = None
+
+            with state_lock:
+                latest_face_box = local_face_box
+                last_face_frame = cropped_last_face_frame
+
+                face_frames.append(face_frame)
+                clip_timestamps.append(timestamp)
+
+                should_infer = (
+                    len(face_frames) == model_window
+                    and (
+                        infer_count == 0
+                        or total_frames_seen % max(1, inference_stride) == 0
+                    )
+                )
+
+                if should_infer:
+                    frames_list = list(face_frames)
+                    timestamps_list = list(clip_timestamps)
+
+                fs = compute_fps_locked()
+
+                result_packet = {
                     "type": "result",
                     "timestamp": timestamp,
                     "face_box": latest_face_box,
                     "rppg_values": list(rppg_buffer),
                     "bpm_values": list(bpm_buffer),
                     "current_bpm": current_bpm,
-                    "quality": compute_quality(fs),
+                    "quality": latest_quality,
                     "fps": fs,
                     "device": device,
                     "model_window": model_window,
@@ -459,8 +594,30 @@ def rppg_worker(
                     "model_warning": model_warning,
                     "warmup_progress": min(1.0, len(face_frames) / float(model_window)),
                     "last_inference_at": last_inference_at,
-                },
-            )
+                }
+
+            _put_latest(result_queue, result_packet)
+
+            if should_infer:
+                try:
+                    infer_queue.put_nowait((frames_list, timestamps_list, timestamp))
+                except std_queue.Full:
+                    # 丢弃本次推理任务，避免堆积导致时延越来越大
+                    pass
+
+    except KeyboardInterrupt:
+        pass
+    finally:
+        stop_event.set()
+
+        try:
+            infer_queue.put_nowait(None)
+        except Exception:
+            pass
+
+        infer_thread.join(timeout=1.0)
+        emit_thread.join(timeout=1.0)
+        stats_thread.join(timeout=1.0)
 
 
 class Monitor:
