@@ -620,7 +620,7 @@ def rppg_worker(
         stats_thread.join(timeout=1.0)
 
 
-class Monitor:
+class Monitor_DP:
     def __init__(
         self,
         model=None,
