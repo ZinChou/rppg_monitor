@@ -259,7 +259,7 @@ def rppg_worker(
                 bpm_timestamps.append(timestamp)
                 bpm_buffer.append(current_bpm)
             last_bpm_update = timestamp
-        print(len(list(rgb_buffer)))
+        # print(len(list(rgb_buffer)))
         _put_latest(
             result_queue,
             {
