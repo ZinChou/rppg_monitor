@@ -629,7 +629,7 @@ class Monitor:
         pos_window_seconds=1.6,
         display_scale=1.0,
         target_fps=30.0,
-        model_weights=None,
+        model_weights='checkpoints/Physformer.pkl',
         model_device=None,
         model_window=DEFAULT_MODEL_WINDOW,
         inference_stride=DEFAULT_INFERENCE_STRIDE,
