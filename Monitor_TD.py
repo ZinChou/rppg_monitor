@@ -107,6 +107,7 @@ def rppg_worker(
     model.fs = target_fps
 
     timestamps = deque()
+    rgb_timestamps = deque()
     rgb_buffer = deque()
     rppg_buffer = deque()
     bpm_buffer = deque()
@@ -120,10 +121,13 @@ def rppg_worker(
         min_t = current_t - buffer_seconds
         while timestamps and timestamps[0] < min_t:
             timestamps.popleft()
-            if rgb_buffer:
-                rgb_buffer.popleft()
             if rppg_buffer:
                 rppg_buffer.popleft()
+
+        while rgb_timestamps and rgb_timestamps[0] < min_t:
+            rgb_timestamps.popleft()
+            if rgb_buffer:
+                rgb_buffer.popleft()
 
         bpm_min_t = current_t - max(30, buffer_seconds * 3)
         while bpm_timestamps and bpm_timestamps[0] < bpm_min_t:
@@ -215,12 +219,13 @@ def rppg_worker(
 
         face_box = model.detect_face(frame)
         latest_rppg = None
-
         if face_box is not None:
             mask = model.build_roi_mask_from_face_box(frame.shape, face_box)
             mean_rgb = model.extract_mean_rgb(frame, mask)
+            
             if mean_rgb is not None:
                 timestamps.append(timestamp)
+                rgb_timestamps.append(timestamp)
                 rgb_buffer.append(mean_rgb)
 
                 win_size = max(10, int(pos_window_seconds * compute_fps()))
@@ -254,7 +259,7 @@ def rppg_worker(
                 bpm_timestamps.append(timestamp)
                 bpm_buffer.append(current_bpm)
             last_bpm_update = timestamp
-
+        # print(len(list(rgb_buffer)))
         _put_latest(
             result_queue,
             {
@@ -269,7 +274,7 @@ def rppg_worker(
         )
 
 
-class Monitor:
+class Monitor_TD:
     def __init__(
         self,
         model=None,
