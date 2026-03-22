@@ -136,8 +136,8 @@ def _crop_face_frame(frame, face_box, image_size, last_face_frame):
             x1, y1, x2, y2 = expanded
             face = frame[y1:y2, x1:x2]
             if face.size != 0:
-                face_rgb = cv2.cvtColor(face, cv2.COLOR_BGR2RGB)
-                resized = cv2.resize(face_rgb, (image_size, image_size), interpolation=cv2.INTER_LINEAR)
+                # face_rgb = cv2.cvtColor(face, cv2.COLOR_BGR2RGB)
+                resized = cv2.resize(face, (image_size, image_size), interpolation=cv2.INTER_LINEAR)
                 return resized, resized
 
     if last_face_frame is not None:
