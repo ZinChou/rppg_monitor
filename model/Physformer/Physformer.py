@@ -189,7 +189,7 @@ class ViT_ST_ST_Compact3_TDC_gra_sharp(nn.Module):
         #pdb.set_trace()
         
         rPPG = rPPG.squeeze(1)
-        rPPG = torch.sin(torch.arange(160, device=rPPG.device) * math.pi / 80).unsqueeze(0)  # [B, 160]
+        # rPPG = torch.sin(torch.arange(160, device=rPPG.device) * math.pi / 80).unsqueeze(0)  # [B, 160]
         return rPPG, Score1, Score2, Score3
 
 

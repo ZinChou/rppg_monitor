@@ -181,9 +181,9 @@ def camera_capture_worker(camera_id, target_fps, frame_queue, processing_queue, 
                 time.sleep(min(frame_interval / 2.0, next_frame_time - now))
                 continue
 
-            # ret, frame = cap.read()
-            ret = True
-            frame = np.zeros((480, 640, 3), dtype=np.uint8)  # 黑色图像（480x640）
+            ret, frame = cap.read()
+            # ret = True
+            # frame = np.zeros((480, 640, 3), dtype=np.uint8)  # 黑色图像（480x640）
             timestamp = time.time()
             if not ret:
                 _put_latest(
