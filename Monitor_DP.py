@@ -618,8 +618,9 @@ def rppg_worker(
             frame = packet["frame"]
             timestamp = packet["timestamp"]
 
+            # start = time.time()
             local_face_box = _detect_face(frame, face_detector)
-
+            # print(time.time() - start)
             with state_lock:
                 frame_times.append(timestamp)
                 total_frames_seen += 1
