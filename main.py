@@ -5,7 +5,7 @@ from Monitor_TD import Monitor_TD
 
 if __name__ == "__main__":
     mp.freeze_support()
-    model = 0 # 0: POS;  1: Model.
+    model = 1 # 0: POS;  1: Model.
 
     if model == 0:
         monitor = Monitor_TD(

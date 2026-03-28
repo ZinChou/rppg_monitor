@@ -22,7 +22,7 @@ from utils import (
 
 DEFAULT_MODEL_WINDOW = 160
 DEFAULT_IMAGE_SIZE = 128
-DEFAULT_INFERENCE_STRIDE = 80
+DEFAULT_INFERENCE_STRIDE = 30
 
 
 def _put_latest(mp_queue, item):
