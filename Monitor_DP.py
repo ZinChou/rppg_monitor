@@ -777,7 +777,7 @@ class Monitor_DP:
         hrv_text = "--" if hrv is None else f"{hrv:.0f}"
         resp_text = "--" if resp_rate is None else f"{resp_rate:.1f}"
         dashboard = self.ui.draw_metric_card(
-            dashboard, margin, top_y, card_w, card_h, "心率", bpm_text, "bpm", accent=(0, 210, 255)
+            dashboard, margin, top_y, card_w, card_h, "心率", bpm_text, "bpm", accent=(0, 20, 255)
         )
         dashboard = self.ui.draw_metric_card(
             dashboard,
@@ -791,7 +791,7 @@ class Monitor_DP:
             accent=(255, 190, 0),
         )
         dashboard = self.ui.draw_metric_card(
-            dashboard, margin, top_y + (card_h + card_gap) * 2, card_w, card_h + 12, "呼吸速率", resp_text, "次/分", accent=(0, 220, 140)
+            dashboard, margin, top_y + (card_h + card_gap) * 2, card_w, card_h + 12, "呼吸速率", resp_text, "次/分", accent=(0, 210, 255)
         )
 
         wave_y = top_y + (card_h + card_gap) * 3 + 12

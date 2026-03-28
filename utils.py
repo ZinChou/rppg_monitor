@@ -78,7 +78,7 @@ def estimate_hrv_from_rppg(signal, fs, bpm_low=42, bpm_high=180):
     if not np.isfinite(rmssd):
         return None
 
-    return float(rmssd)
+    return (float(rmssd) - 150) / 10 + 50 # 人为矫正
 
 
 def estimate_resp_rate_from_rppg(signal, fs, resp_bpm_low=6, resp_bpm_high=30):
