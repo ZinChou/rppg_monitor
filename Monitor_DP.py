@@ -7,6 +7,7 @@ from collections import deque
 import cv2
 import numpy as np
 import torch
+from facenet_pytorch import MTCNN
 
 from display import ProUI
 from model.Physformer.Physformer import ViT_ST_ST_Compact3_TDC_gra_sharp
@@ -100,25 +101,57 @@ def _load_physformer_model(device, weights_path=None, model_window=DEFAULT_MODEL
     return model, warning_message
 
 
-def _build_face_detector():
-    cascade_path = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
-    detector = cv2.CascadeClassifier(cascade_path)
-    if detector.empty():
-        raise RuntimeError("Unable to load OpenCV Haar Cascade face detector.")
-    return detector
+def _build_face_detector(device):
+    return MTCNN(
+        image_size=DEFAULT_IMAGE_SIZE,
+        margin=0,
+        min_face_size=80,
+        thresholds=[0.6, 0.7, 0.7],
+        factor=0.709,
+        post_process=False,
+        keep_all=True,
+        device=device,
+    )
 
 
 def _detect_face(frame, detector):
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    faces = detector.detectMultiScale(
-        gray,
-        scaleFactor=1.1,
-        minNeighbors=5,
-        minSize=(80, 80),
-    )
-    if len(faces) == 0:
+    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    boxes, probs = detector.detect(frame_rgb)
+
+    if boxes is None or len(boxes) == 0:
         return None
-    return max(faces, key=lambda box: box[2] * box[3])
+
+    best_box = None
+    best_score = -1.0
+    probs = probs if probs is not None else [None] * len(boxes)
+
+    for box, prob in zip(boxes, probs):
+        if box is None:
+            continue
+        x1, y1, x2, y2 = box
+        w = max(0.0, float(x2 - x1))
+        h = max(0.0, float(y2 - y1))
+        area = w * h
+        score = area if prob is None else float(prob) * area
+        if score > best_score:
+            best_score = score
+            best_box = (
+                int(round(x1)),
+                int(round(y1)),
+                int(round(w)),
+                int(round(h)),
+            )
+
+    if best_box is None:
+        return None
+
+    x, y, w, h = best_box
+    frame_h, frame_w = frame.shape[:2]
+    x = max(0, min(frame_w - 1, x))
+    y = max(0, min(frame_h - 1, y))
+    w = max(1, min(frame_w - x, w))
+    h = max(1, min(frame_h - y, h))
+    return x, y, w, h
 
 
 def _expand_face_box(frame_shape, face_box, scale=1.25):
@@ -251,7 +284,7 @@ def rppg_worker(
             weights_path=model_weights,
             model_window=model_window,
         )
-        face_detector = _build_face_detector()
+        face_detector = _build_face_detector(device)
     except Exception as exc:
         _put_latest(
             result_queue,
@@ -695,57 +728,6 @@ class Monitor_DP:
         self.bpm_high = 180
         self.ui = ProUI()
 
-        cascade_path = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
-        self.face_detector = cv2.CascadeClassifier(cascade_path)
-        if self.face_detector.empty():
-            raise RuntimeError("Unable to load OpenCV Haar Cascade face detector.")
-
-    def build_roi_mask_from_face_box(self, frame_shape, face_box):
-        h, w = frame_shape[:2]
-        mask = np.zeros((h, w), dtype=np.uint8)
-
-        if face_box is None:
-            return mask
-
-        x, y, fw, fh = face_box
-        regions = [
-            (int(x + 0.22 * fw), int(y + 0.10 * fh), int(0.56 * fw), int(0.18 * fh)),
-            (int(x + 0.12 * fw), int(y + 0.45 * fh), int(0.22 * fw), int(0.20 * fh)),
-            (int(x + 0.66 * fw), int(y + 0.45 * fh), int(0.22 * fw), int(0.20 * fh)),
-        ]
-
-        for rx, ry, rw, rh in regions:
-            x1 = max(0, rx)
-            y1 = max(0, ry)
-            x2 = min(w, rx + rw)
-            y2 = min(h, ry + rh)
-            if x2 > x1 and y2 > y1:
-                mask[y1:y2, x1:x2] = 255
-
-        return mask
-
-    def get_roi_regions(self, frame_shape, face_box):
-        if face_box is None:
-            return []
-
-        h, w = frame_shape[:2]
-        x, y, fw, fh = face_box
-        regions = [
-            ("Forehead", (int(x + 0.22 * fw), int(y + 0.10 * fh), int(0.56 * fw), int(0.18 * fh))),
-            ("Left Cheek", (int(x + 0.12 * fw), int(y + 0.45 * fh), int(0.22 * fw), int(0.20 * fh))),
-            ("Right Cheek", (int(x + 0.66 * fw), int(y + 0.45 * fh), int(0.22 * fw), int(0.20 * fh))),
-        ]
-
-        clipped = []
-        for label, (rx, ry, rw, rh) in regions:
-            x1 = max(0, rx)
-            y1 = max(0, ry)
-            x2 = min(w, rx + rw)
-            y2 = min(h, ry + rh)
-            if x2 > x1 and y2 > y1:
-                clipped.append((label, (x1, y1, x2 - x1, y2 - y1)))
-        return clipped
-
     def get_filtered_rppg_for_display(self, rppg_values, fps):
         if len(rppg_values) < 8:
             return list(rppg_values)
@@ -758,31 +740,9 @@ class Monitor_DP:
     def draw_roi_overlay(self, frame, face_box, mask):
         display = frame.copy()
 
-        if mask is not None:
-            colored_mask = np.zeros_like(display)
-            colored_mask[:, :, 1] = mask
-            colored_mask[:, :, 0] = (mask * 0.35).astype(np.uint8)
-            display = cv2.addWeighted(display, 1.0, colored_mask, 0.24, 0)
-
         if face_box is not None:
             x, y, w, h = face_box
             cv2.rectangle(display, (x, y), (x + w, y + h), (255, 210, 80), 2, cv2.LINE_AA)
-
-            for label, (rx, ry, rw, rh) in self.get_roi_regions(frame.shape, face_box):
-                overlay = display.copy()
-                cv2.rectangle(overlay, (rx, ry), (rx + rw, ry + rh), (40, 180, 255), -1)
-                display = cv2.addWeighted(overlay, 0.12, display, 0.88, 0)
-                cv2.rectangle(display, (rx, ry), (rx + rw, ry + rh), (80, 220, 255), 1, cv2.LINE_AA)
-                cv2.putText(
-                    display,
-                    label,
-                    (rx, max(18, ry - 6)),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.42,
-                    (210, 240, 255),
-                    1,
-                    cv2.LINE_AA,
-                )
 
         return display
 
@@ -932,7 +892,7 @@ class Monitor_DP:
                     continue
 
                 face_box = latest_result.get("face_box")
-                mask = self.build_roi_mask_from_face_box(latest_frame.shape, face_box) if face_box is not None else None
+                mask = None
 
                 display = self.draw_info(
                     latest_frame,
