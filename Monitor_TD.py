@@ -293,7 +293,7 @@ def rppg_worker(
                 if should_accept_metric_update(
                     resp_rate,
                     current=current_resp_rate,
-                    min_value=6.0,
+                    min_value=12.0,
                     max_value=30.0,
                     max_abs_delta=6.0,
                     max_rel_delta=0.35,
