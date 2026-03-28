@@ -8,7 +8,14 @@ import numpy as np
 
 from display import ProUI
 from model.POS import POS
-from utils import estimate_hr_from_rppg, bandpass_filter, normalize_signal
+from utils import (
+    bandpass_filter,
+    estimate_hr_from_rppg,
+    estimate_hrv_from_rppg,
+    estimate_resp_rate_from_rppg,
+    normalize_signal,
+    should_accept_metric_update,
+)
 
 
 def _put_latest(mp_queue, item):
@@ -115,6 +122,8 @@ def rppg_worker(
     frame_times = deque(maxlen=120)
 
     current_bpm = None
+    current_hrv = None
+    current_resp_rate = None
     last_bpm_update = 0.0
 
     def trim_buffers(current_t):
@@ -251,13 +260,48 @@ def rppg_worker(
         fs = compute_fps()
         if timestamp - last_bpm_update > 1.0 and len(rppg_buffer) > max(30, int(fs * 4)):
             bpm = estimate_hr_from_rppg(list(rppg_buffer), fs, bpm_low=bpm_low, bpm_high=bpm_high)
-            if bpm is not None:
+            if should_accept_metric_update(
+                bpm,
+                current=current_bpm,
+                min_value=bpm_low,
+                max_value=bpm_high,
+                max_abs_delta=18.0,
+                max_rel_delta=0.22,
+            ):
                 if current_bpm is None:
                     current_bpm = bpm
                 else:
                     current_bpm = 0.85 * current_bpm + 0.15 * bpm
                 bpm_timestamps.append(timestamp)
                 bpm_buffer.append(current_bpm)
+
+                hrv = estimate_hrv_from_rppg(list(rppg_buffer), fs, bpm_low=bpm_low, bpm_high=bpm_high)
+                if should_accept_metric_update(
+                    hrv,
+                    current=current_hrv,
+                    min_value=8.0,
+                    max_value=250.0,
+                    max_abs_delta=45.0,
+                    max_rel_delta=0.6,
+                ):
+                    if current_hrv is None:
+                        current_hrv = hrv
+                    else:
+                        current_hrv = 0.8 * current_hrv + 0.2 * hrv
+
+                resp_rate = estimate_resp_rate_from_rppg(list(rppg_buffer), fs)
+                if should_accept_metric_update(
+                    resp_rate,
+                    current=current_resp_rate,
+                    min_value=6.0,
+                    max_value=30.0,
+                    max_abs_delta=6.0,
+                    max_rel_delta=0.35,
+                ):
+                    if current_resp_rate is None:
+                        current_resp_rate = resp_rate
+                    else:
+                        current_resp_rate = 0.8 * current_resp_rate + 0.2 * resp_rate
             last_bpm_update = timestamp
         # print(len(list(rgb_buffer)))
         _put_latest(
@@ -268,6 +312,8 @@ def rppg_worker(
                 "rppg_values": list(rppg_buffer),
                 "bpm_values": list(bpm_buffer),
                 "current_bpm": current_bpm,
+                "current_hrv": current_hrv,
+                "current_resp_rate": current_resp_rate,
                 "quality": compute_quality(),
                 "fps": fs,
             },
@@ -386,7 +432,7 @@ class Monitor_TD:
 
         return display
 
-    def draw_info(self, frame, face_box, mask, bpm, rppg_values, fps, quality):
+    def draw_info(self, frame, face_box, mask, bpm, hrv, resp_rate, rppg_values, fps):
         video_view = self.draw_roi_overlay(frame, face_box, mask)
 
         h, w = video_view.shape[:2]
@@ -396,15 +442,14 @@ class Monitor_TD:
         dashboard = np.zeros((h, panel_w, 3), dtype=np.uint8)
         dashboard = self.ui.draw_panel_background(dashboard)
 
-        cv2.putText(
+        self.ui.draw_text(
             video_view,
-            "Camera View",
+            "摄像头画面",
             (16, 28),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.7,
             (235, 235, 235),
             2,
-            cv2.LINE_AA,
         )
 
         filtered_rppg = self.get_filtered_rppg_for_display(rppg_values, fps)
@@ -414,14 +459,16 @@ class Monitor_TD:
         top_y = 18
 
         bpm_text = "--" if bpm is None else f"{int(round(bpm))}"
+        hrv_text = "--" if hrv is None else f"{hrv:.0f}"
+        resp_text = "--" if resp_rate is None else f"{resp_rate:.1f}"
         dashboard = self.ui.draw_metric_card(
-            dashboard, margin, top_y, card_w, card_h, "Heart Rate", bpm_text, "bpm", accent=(0, 210, 255)
+            dashboard, margin, top_y, card_w, card_h, "心率", bpm_text, "bpm", accent=(0, 210, 255)
         )
         dashboard = self.ui.draw_metric_card(
-            dashboard, margin, top_y + card_h + card_gap, card_w, card_h, "Frame Rate", f"{fps:.1f}", "fps", accent=(255, 190, 0)
+            dashboard, margin, top_y + card_h + card_gap, card_w, card_h, "心率变异性", hrv_text, "ms", accent=(255, 190, 0)
         )
-        dashboard = self.ui.draw_quality_card(
-            dashboard, margin, top_y + (card_h + card_gap) * 2, card_w, card_h + 12, quality
+        dashboard = self.ui.draw_metric_card(
+            dashboard, margin, top_y + (card_h + card_gap) * 2, card_w, card_h + 12, "呼吸速率", resp_text, "次/分", accent=(0, 220, 140)
         )
 
         wave_y = top_y + (card_h + card_gap) * 3 + 12
@@ -437,15 +484,14 @@ class Monitor_TD:
             fill_color=(24, 32, 32),
             border_color=(56, 76, 76),
         )
-        cv2.putText(
+        self.ui.draw_text(
             dashboard,
-            "Press 'q' to quit",
+            "按 q 退出",
             (margin + 12, h - 22),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.5,
             self.ui.panel_muted,
             1,
-            cv2.LINE_AA,
         )
 
         separator = np.full((h, gap, 3), 20, dtype=np.uint8)
@@ -493,6 +539,8 @@ class Monitor_TD:
             "face_box": None,
             "rppg_values": [],
             "current_bpm": None,
+            "current_hrv": None,
+            "current_resp_rate": None,
             "quality": 0.0,
             "fps": self.target_fps,
         }
@@ -523,9 +571,10 @@ class Monitor_TD:
                     face_box,
                     mask,
                     latest_result.get("current_bpm"),
+                    latest_result.get("current_hrv"),
+                    latest_result.get("current_resp_rate"),
                     latest_result.get("rppg_values", []),
                     latest_result.get("fps", self.target_fps),
-                    latest_result.get("quality", 0.0),
                 )
                 cv2.imshow("rPPG Monitor", display)
 

@@ -1,5 +1,8 @@
+import os
+
 import cv2
 import numpy as np
+from PIL import Image, ImageDraw, ImageFont
 
 
 class ProUI:
@@ -11,11 +14,66 @@ class ProUI:
         self.panel_text = (235, 240, 238)
         self.panel_muted = (150, 170, 164)
         self.panel_grid = (46, 64, 58)
+        self.font_path = self._resolve_font_path()
+        self.font_cache = {}
+
+    def _resolve_font_path(self):
+        candidates = [
+            r"C:\Windows\Fonts\msyh.ttc",
+            r"C:\Windows\Fonts\msyhbd.ttc",
+            r"C:\Windows\Fonts\simhei.ttf",
+            r"C:\Windows\Fonts\simsun.ttc",
+        ]
+        for path in candidates:
+            if os.path.exists(path):
+                return path
+        return None
+
+    def _is_ascii(self, text):
+        return all(ord(ch) < 128 for ch in str(text))
+
+    def _get_pil_font(self, pixel_size):
+        pixel_size = max(12, int(round(pixel_size)))
+        cache_key = (self.font_path, pixel_size)
+        if cache_key not in self.font_cache:
+            if self.font_path is not None:
+                self.font_cache[cache_key] = ImageFont.truetype(self.font_path, pixel_size)
+            else:
+                self.font_cache[cache_key] = ImageFont.load_default()
+        return self.font_cache[cache_key]
+
+    def get_text_size(self, text, font, scale, thickness=1):
+        text = str(text)
+        if self._is_ascii(text):
+            return cv2.getTextSize(text, font, scale, thickness)[0]
+
+        pil_font = self._get_pil_font(scale * 32)
+        dummy = Image.new("RGB", (1, 1), (0, 0, 0))
+        draw = ImageDraw.Draw(dummy)
+        bbox = draw.textbbox((0, 0), text, font=pil_font)
+        return bbox[2] - bbox[0], bbox[3] - bbox[1]
+
+    def draw_text(self, frame, text, org, font, scale, color, thickness=1, line_type=cv2.LINE_AA):
+        text = str(text)
+        x, y = org
+        if self._is_ascii(text):
+            cv2.putText(frame, text, (x, y), font, scale, color, thickness, line_type)
+            return frame
+
+        pil_font = self._get_pil_font(scale * 32)
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        image = Image.fromarray(rgb)
+        draw = ImageDraw.Draw(image)
+        bbox = draw.textbbox((0, 0), text, font=pil_font)
+        text_h = bbox[3] - bbox[1]
+        draw.text((x, y - text_h), text, font=pil_font, fill=(int(color[2]), int(color[1]), int(color[0])))
+        frame[:] = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
+        return frame
 
     def fit_font_scale(self, text, font, max_width, base_scale, thickness):
         scale = base_scale
         while scale > 0.3:
-            width = cv2.getTextSize(text, font, scale, thickness)[0][0]
+            width = self.get_text_size(text, font, scale, thickness)[0]
             if width <= max_width:
                 break
             scale -= 0.05
@@ -58,46 +116,39 @@ class ProUI:
     def draw_metric_card(self, frame, x, y, w, h, label, value, unit="", accent=(0, 200, 255)):
         frame = self.draw_solid_panel(frame, x, y, w, h, fill_color=(24, 32, 32), border_color=(56, 76, 76))
         cv2.line(frame, (x + 14, y + 14), (x + 14, y + h - 14), accent, 3, cv2.LINE_AA)
-        cv2.putText(
-            frame, label, (x + 28, y + 28),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.52, self.panel_muted, 1, cv2.LINE_AA
-        )
+        self.draw_text(frame, label, (x + 28, y + 28), cv2.FONT_HERSHEY_SIMPLEX, 0.52, self.panel_muted, 1)
 
         text = str(value)
         scale = self.fit_font_scale(text, cv2.FONT_HERSHEY_DUPLEX, w - 48, 1.2, 2)
         value_y = y + h - 22
-        cv2.putText(
-            frame, text, (x + 28, value_y),
-            cv2.FONT_HERSHEY_DUPLEX, scale, self.panel_text, 2, cv2.LINE_AA
-        )
+        self.draw_text(frame, text, (x + 28, value_y), cv2.FONT_HERSHEY_DUPLEX, scale, self.panel_text, 2)
         if unit:
-            text_w = cv2.getTextSize(text, cv2.FONT_HERSHEY_DUPLEX, scale, 2)[0][0]
-            cv2.putText(
-                frame, unit, (x + 36 + text_w, value_y - 2),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.45, self.panel_muted, 1, cv2.LINE_AA
+            text_w = self.get_text_size(text, cv2.FONT_HERSHEY_DUPLEX, scale, 2)[0]
+            self.draw_text(
+                frame,
+                unit,
+                (x + 36 + text_w, value_y - 2),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.45,
+                self.panel_muted,
+                1,
             )
         return frame
 
     def draw_quality_card(self, frame, x, y, w, h, quality):
         status, color = self.signal_status(quality)
-        frame = self.draw_metric_card(frame, x, y, w, h, "Signal Quality", f"{quality:.3f}", accent=color)
+        frame = self.draw_metric_card(frame, x, y, w, h, "信号质量", f"{quality:.3f}", accent=color)
         bar_x = x + 28
         bar_y = y + h - 18
         bar_w = w - 56
         bar_h = 10
         self.draw_signal_bar(frame, bar_x, bar_y, bar_w, bar_h, quality)
-        cv2.putText(
-            frame, status, (x + w - 74, y + 28),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv2.LINE_AA
-        )
+        self.draw_text(frame, status, (x + w - 74, y + 28), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
         return frame
 
     def draw_simple_waveform(self, frame, values, x, y, w, h):
         frame = self.draw_solid_panel(frame, x, y, w, h, fill_color=(24, 32, 32), border_color=(56, 76, 76))
-        cv2.putText(
-            frame, "rPPG Signal", (x + 16, y + 24),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.6, self.panel_text, 1, cv2.LINE_AA
-        )
+        self.draw_text(frame, "rPPG 信号", (x + 16, y + 24), cv2.FONT_HERSHEY_SIMPLEX, 0.6, self.panel_text, 1)
 
         graph_x = x + 12
         graph_y = y + 36
@@ -109,10 +160,7 @@ class ProUI:
             cv2.line(frame, (graph_x, yy), (graph_x + graph_w, yy), self.panel_grid, 1, cv2.LINE_AA)
 
         if len(values) < 8:
-            cv2.putText(
-                frame, "waiting for signal...", (x + 16, y + h // 2),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.55, self.panel_muted, 1, cv2.LINE_AA
-            )
+            self.draw_text(frame, "等待信号中...", (x + 16, y + h // 2), cv2.FONT_HERSHEY_SIMPLEX, 0.55, self.panel_muted, 1)
             return frame
 
         vals = np.array(values[-graph_w:], dtype=np.float32)
@@ -142,22 +190,13 @@ class ProUI:
             cv2.line(frame, pts[i - 1], pts[i], (0, 235, 150), 2, cv2.LINE_AA)
 
         cv2.circle(frame, pts[-1], 4, (130, 255, 190), -1, cv2.LINE_AA)
-        cv2.putText(
-            frame, f"{values[-1]:+.2f}", (x + w - 80, y + 24),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.48, (170, 230, 200), 1, cv2.LINE_AA
-        )
+        self.draw_text(frame, f"{values[-1]:+.2f}", (x + w - 80, y + 24), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (170, 230, 200), 1)
         return frame
 
     def draw_dashboard_header(self, frame, x, y, w):
         frame = self.draw_solid_panel(frame, x, y, w, 62, fill_color=(24, 38, 36))
-        cv2.putText(
-            frame, "Vital Signs Monitor", (x + 16, y + 26),
-            cv2.FONT_HERSHEY_DUPLEX, 0.78, self.panel_text, 1, cv2.LINE_AA
-        )
-        cv2.putText(
-            frame, "Remote PPG Dashboard", (x + 16, y + 48),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.46, self.panel_muted, 1, cv2.LINE_AA
-        )
+        self.draw_text(frame, "生命体征监测", (x + 16, y + 26), cv2.FONT_HERSHEY_DUPLEX, 0.78, self.panel_text, 1)
+        self.draw_text(frame, "远程 PPG 仪表盘", (x + 16, y + 48), cv2.FONT_HERSHEY_SIMPLEX, 0.46, self.panel_muted, 1)
         cv2.line(frame, (x + w - 76, y + 18), (x + w - 22, y + 18), (90, 200, 150), 2, cv2.LINE_AA)
         cv2.line(frame, (x + w - 76, y + 30), (x + w - 36, y + 30), (0, 200, 255), 2, cv2.LINE_AA)
         cv2.line(frame, (x + w - 76, y + 42), (x + w - 52, y + 42), (255, 190, 0), 2, cv2.LINE_AA)
@@ -167,16 +206,13 @@ class ProUI:
         font = cv2.FONT_HERSHEY_SIMPLEX
         scale = 0.48
         thickness = 1
-        text_size = cv2.getTextSize(text, font, scale, thickness)[0]
+        text_size = self.get_text_size(text, font, scale, thickness)
         w = text_size[0] + pad_x * 2
         h = text_size[1] + pad_y * 2
         frame = self.draw_glass_panel(frame, x, y, w, h, alpha=0.22)
         overlay = self.draw_rounded_rect(frame.copy(), x, y, w, h, bg_color, radius=14, thickness=-1)
         frame = cv2.addWeighted(overlay, 0.2, frame, 0.8, 0)
-        cv2.putText(
-            frame, text, (x + pad_x, y + h - pad_y - 2),
-            font, scale, text_color, thickness, cv2.LINE_AA
-        )
+        self.draw_text(frame, text, (x + pad_x, y + h - pad_y - 2), font, scale, text_color, thickness)
         return frame
 
     def draw_stat_tile(self, frame, x, y, w, h, label, value, accent, value_color=(255, 255, 255)):
@@ -185,25 +221,18 @@ class ProUI:
         cv2.rectangle(overlay, (x, y), (x + w, y + h // 2), (40, 55, 52), -1)
         frame = cv2.addWeighted(overlay, 0.16, frame, 0.84, 0)
         cv2.line(frame, (x + 12, y + 12), (x + 12, y + h - 12), accent, 3, cv2.LINE_AA)
-        cv2.putText(
-            frame, label, (x + 24, y + 24),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.48, self.panel_muted, 1, cv2.LINE_AA
-        )
+        self.draw_text(frame, label, (x + 24, y + 24), cv2.FONT_HERSHEY_SIMPLEX, 0.48, self.panel_muted, 1)
         scale = self.fit_font_scale(str(value), cv2.FONT_HERSHEY_DUPLEX, w - 36, 0.95, 2)
-        cv2.putText(
-            frame, str(value), (x + 24, y + h - 16),
-            cv2.FONT_HERSHEY_DUPLEX, scale, value_color, 2, cv2.LINE_AA
-        )
+        self.draw_text(frame, str(value), (x + 24, y + h - 16), cv2.FONT_HERSHEY_DUPLEX, scale, value_color, 2)
         cv2.circle(frame, (x + w - 18, y + 18), 4, accent, -1, cv2.LINE_AA)
         return frame
 
     def signal_status(self, quality):
         if quality >= 0.18:
-            return "GOOD", (0, 220, 0)
-        elif quality >= 0.09:
-            return "OK", (0, 180, 255)
-        else:
-            return "POOR", (0, 0, 255)
+            return "良好", (0, 220, 0)
+        if quality >= 0.09:
+            return "一般", (0, 180, 255)
+        return "较差", (0, 0, 255)
 
     def draw_heart(self, frame, center, size, bpm):
         x, y = center
@@ -237,17 +266,10 @@ class ProUI:
 
     def draw_waveform(self, frame, values, x, y, w, h, title="rPPG"):
         frame = self.draw_solid_panel(frame, x, y, w, h, fill_color=(22, 34, 32))
-
-        cv2.putText(
-            frame, title, (x + 14, y + 24),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.6, self.panel_text, 1, cv2.LINE_AA
-        )
+        self.draw_text(frame, title, (x + 14, y + 24), cv2.FONT_HERSHEY_SIMPLEX, 0.6, self.panel_text, 1)
 
         if len(values) < 8:
-            cv2.putText(
-                frame, "waiting for signal...", (x + 14, y + h // 2),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.55, self.panel_muted, 1, cv2.LINE_AA
-            )
+            self.draw_text(frame, "等待信号中...", (x + 14, y + h // 2), cv2.FONT_HERSHEY_SIMPLEX, 0.55, self.panel_muted, 1)
             return frame
 
         graph_x = x + 10
@@ -288,26 +310,15 @@ class ProUI:
 
         latest = values[-1]
         cv2.circle(frame, pts[-1], 4, (120, 255, 180), -1, cv2.LINE_AA)
-        cv2.putText(
-            frame, f"latest {latest:+.2f}", (x + w - 132, y + 24),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.44, (150, 220, 180), 1, cv2.LINE_AA
-        )
-
+        self.draw_text(frame, f"当前 {latest:+.2f}", (x + w - 132, y + 24), cv2.FONT_HERSHEY_SIMPLEX, 0.44, (150, 220, 180), 1)
         return frame
 
     def draw_bpm_chart(self, frame, values, x, y, w, h, bpm_low, bpm_high):
         frame = self.draw_solid_panel(frame, x, y, w, h, fill_color=(22, 34, 32))
-
-        cv2.putText(
-            frame, "BPM Trend", (x + 14, y + 24),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.6, self.panel_text, 1, cv2.LINE_AA
-        )
+        self.draw_text(frame, "心率趋势", (x + 14, y + 24), cv2.FONT_HERSHEY_SIMPLEX, 0.6, self.panel_text, 1)
 
         if len(values) < 2:
-            cv2.putText(
-                frame, "collecting bpm...", (x + 14, y + h // 2),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.55, self.panel_muted, 1, cv2.LINE_AA
-            )
+            self.draw_text(frame, "心率采集中...", (x + 14, y + h // 2), cv2.FONT_HERSHEY_SIMPLEX, 0.55, self.panel_muted, 1)
             return frame
 
         graph_x = x + 10
@@ -330,10 +341,7 @@ class ProUI:
             if bpm_low <= bpm_mark <= bpm_high:
                 yy = graph_y + int((1.0 - (bpm_mark - bpm_low) / (bpm_high - bpm_low)) * graph_h)
                 cv2.line(frame, (graph_x, yy), (graph_x + graph_w, yy), self.panel_grid, 1, cv2.LINE_AA)
-                cv2.putText(
-                    frame, str(bpm_mark), (graph_x + 4, yy - 4),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.38, self.panel_muted, 1, cv2.LINE_AA
-                )
+                self.draw_text(frame, str(bpm_mark), (graph_x + 4, yy - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.38, self.panel_muted, 1)
 
         if len(pts) > 1:
             fill_pts = np.array([(graph_x, graph_y + graph_h)] + pts + [(pts[-1][0], graph_y + graph_h)], dtype=np.int32)
@@ -345,11 +353,7 @@ class ProUI:
             cv2.line(frame, pts[i - 1], pts[i], (0, 200, 255), 2, cv2.LINE_AA)
 
         cv2.circle(frame, pts[-1], 4, (130, 230, 255), -1, cv2.LINE_AA)
-        cv2.putText(
-            frame, f"now {values[-1]:.0f} bpm", (x + w - 118, y + 24),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.44, (160, 220, 235), 1, cv2.LINE_AA
-        )
-
+        self.draw_text(frame, f"当前 {values[-1]:.0f} bpm", (x + w - 118, y + 24), cv2.FONT_HERSHEY_SIMPLEX, 0.44, (160, 220, 235), 1)
         return frame
 
     def draw_main_card(self, frame, bpm, quality, fps, face_ok, x=14, y=14, w=290, h=170):
@@ -361,42 +365,21 @@ class ProUI:
         self.draw_heart(frame, (x + 38, y + 50), 18, bpm)
 
         if bpm is not None:
-            cv2.putText(
-                frame, f"{int(round(bpm))}",
-                (x + 74, y + 64), cv2.FONT_HERSHEY_DUPLEX, 1.6, (255, 255, 255), 2, cv2.LINE_AA
-            )
-            cv2.putText(
-                frame, "BPM",
-                (x + 78, y + 94), cv2.FONT_HERSHEY_SIMPLEX, 0.62, self.panel_muted, 1, cv2.LINE_AA
-            )
+            self.draw_text(frame, f"{int(round(bpm))}", (x + 74, y + 64), cv2.FONT_HERSHEY_DUPLEX, 1.6, (255, 255, 255), 2)
+            self.draw_text(frame, "BPM", (x + 78, y + 94), cv2.FONT_HERSHEY_SIMPLEX, 0.62, self.panel_muted, 1)
         else:
-            cv2.putText(
-                frame, "--",
-                (x + 74, y + 64), cv2.FONT_HERSHEY_DUPLEX, 1.6, (120, 120, 120), 2, cv2.LINE_AA
-            )
-            cv2.putText(
-                frame, "estimating",
-                (x + 78, y + 94), cv2.FONT_HERSHEY_SIMPLEX, 0.62, self.panel_muted, 1, cv2.LINE_AA
-            )
+            self.draw_text(frame, "--", (x + 74, y + 64), cv2.FONT_HERSHEY_DUPLEX, 1.6, (120, 120, 120), 2)
+            self.draw_text(frame, "估算中", (x + 78, y + 94), cv2.FONT_HERSHEY_SIMPLEX, 0.62, self.panel_muted, 1)
 
         status, color = self.signal_status(quality)
-        cv2.putText(
-            frame, f"Signal: {status}",
-            (x + 6, y + 122), cv2.FONT_HERSHEY_SIMPLEX, 0.62, color, 2, cv2.LINE_AA
-        )
+        self.draw_text(frame, f"信号: {status}", (x + 6, y + 122), cv2.FONT_HERSHEY_SIMPLEX, 0.62, color, 2)
         self.draw_signal_bar(frame, x + 6, y + 132, min(180, w - 100), 12, quality)
 
-        cv2.putText(
-            frame, f"FPS: {fps:.1f}",
-            (x + w - 89, y + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (180, 255, 180), 1, cv2.LINE_AA
-        )
+        self.draw_text(frame, f"FPS: {fps:.1f}", (x + w - 89, y + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (180, 255, 180), 1)
 
-        state_text = "TRACKING" if face_ok else "FACE LOST"
+        state_text = "跟踪中" if face_ok else "人脸丢失"
         state_color = (0, 220, 0) if face_ok else (0, 0, 255)
-        cv2.putText(
-            frame, state_text,
-            (x + w - 96, y + h - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.52, state_color, 2, cv2.LINE_AA
-        )
+        self.draw_text(frame, state_text, (x + w - 96, y + h - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.52, state_color, 2)
 
         return frame
 
@@ -404,17 +387,16 @@ class ProUI:
         h, w = frame.shape[:2]
 
         if not face_ok:
-            text = "Face Lost"
+            text = "人脸丢失"
             color = (0, 0, 255)
         elif quality < 0.06:
-            text = "Hold Still"
+            text = "请保持稳定"
             color = (0, 180, 255)
         else:
-            text = "Stable"
+            text = "状态稳定"
             color = (0, 220, 0)
 
-        text_size = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.85, 2)[0]
+        text_size = self.get_text_size(text, cv2.FONT_HERSHEY_SIMPLEX, 0.85, 2)
         x = (w - text_size[0]) // 2
-        y = 36
-        frame = self.draw_chip(frame, text.upper(), max(12, x - 14), 10, color)
+        frame = self.draw_chip(frame, text, max(12, x - 14), 10, color)
         return frame

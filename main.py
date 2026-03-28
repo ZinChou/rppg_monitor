@@ -17,6 +17,7 @@ if __name__ == "__main__":
         )
     else:
         monitor = Monitor_DP(
+            
             camera_id=0,
             buffer_seconds=10,
             pos_window_seconds=1.6,
