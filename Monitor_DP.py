@@ -48,6 +48,14 @@ def _drain_latest(mp_queue):
     return latest
 
 
+def _drain_all(mp_queue):
+    while True:
+        try:
+            mp_queue.get_nowait()
+        except queue.Empty:
+            break
+
+
 def _resolve_device(device):
     if device is not None:
         if device.startswith("cuda") and not torch.cuda.is_available():
@@ -612,7 +620,69 @@ def rppg_worker(
             except std_queue.Empty:
                 continue
 
-            if packet.get("type") != "frame":
+            packet_type = packet.get("type")
+            if packet_type == "clear_cache":
+                with state_lock:
+                    face_frames.clear()
+                    clip_timestamps.clear()
+                    signal_timestamps.clear()
+                    rppg_buffer.clear()
+                    bpm_timestamps.clear()
+                    bpm_buffer.clear()
+                    pending_rppg_points.clear()
+                    frame_times.clear()
+
+                    latest_face_box = None
+                    last_face_frame = None
+
+                    next_rppg_emit_time = None
+                    current_bpm = None
+                    current_hrv = None
+                    current_resp_rate = None
+                    latest_quality = 0.0
+                    last_bpm_update = 0.0
+                    last_inference_at = 0.0
+
+                    total_frames_seen = 0
+                    infer_count = 0
+
+                while True:
+                    try:
+                        infer_queue.get_nowait()
+                    except std_queue.Empty:
+                        break
+
+                while True:
+                    try:
+                        stats_queue.get_nowait()
+                    except std_queue.Empty:
+                        break
+
+                _drain_all(processing_queue)
+                _put_latest(
+                    result_queue,
+                    {
+                        "type": "result",
+                        "timestamp": time.time(),
+                        "face_box": None,
+                        "rppg_values": [],
+                        "bpm_values": [],
+                        "current_bpm": None,
+                        "current_hrv": None,
+                        "current_resp_rate": None,
+                        "quality": 0.0,
+                        "fps": float(target_fps),
+                        "device": device,
+                        "model_window": model_window,
+                        "inference_stride": inference_stride,
+                        "model_warning": model_warning,
+                        "warmup_progress": 0.0,
+                        "last_inference_at": 0.0,
+                    },
+                )
+                continue
+
+            if packet_type != "frame":
                 continue
 
             frame = packet["frame"]
@@ -809,7 +879,7 @@ class Monitor_DP:
         )
         self.ui.draw_text(
             dashboard,
-            "按 q 退出",
+            "按 q 退出 | 按 c 重置",
             (margin + 12, h - 22),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.5,
@@ -907,8 +977,23 @@ class Monitor_DP:
                 )
                 cv2.imshow("rPPG Monitor (Deep)", display)
 
-                if cv2.waitKey(1) & 0xFF == ord("q"):
+                key = cv2.waitKey(1) & 0xFF
+                if key == ord("q"):
                     break
+                if key == ord("c"):
+                    self.ui.clear_cache()
+                    latest_result = {
+                        "face_box": None,
+                        "rppg_values": [],
+                        "current_bpm": None,
+                        "current_hrv": None,
+                        "current_resp_rate": None,
+                        "quality": 0.0,
+                        "fps": self.target_fps,
+                        "model_warning": None,
+                    }
+                    _drain_all(result_queue)
+                    _put_latest(processing_queue, {"type": "clear_cache", "timestamp": time.time()})
 
                 if not camera_process.is_alive():
                     raise RuntimeError("Camera process exited unexpectedly.")

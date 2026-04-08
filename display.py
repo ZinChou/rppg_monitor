@@ -17,6 +17,9 @@ class ProUI:
         self.font_path = self._resolve_font_path()
         self.font_cache = {}
 
+    def clear_cache(self):
+        self.font_cache.clear()
+
     def _resolve_font_path(self):
         candidates = [
             r"C:\Windows\Fonts\msyh.ttc",
